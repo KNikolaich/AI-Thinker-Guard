@@ -9,12 +9,12 @@ struct AppConfig {
   String telegramToken;
   String chatId;
   String ownerMac;
-  String webPassword;
-  String otaPassword;
+  String devicePassword;
   uint8_t motionCount = 3;
   uint8_t manualCount = 3;
   uint16_t periodicMinutes = 30;
   uint32_t timeoutSeconds = 300;
+  bool otaEnabled = false;
   bool quietEnabled = false;
   String quietStart = "23:00";
   String quietEnd = "07:00";

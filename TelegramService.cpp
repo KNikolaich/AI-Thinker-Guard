@@ -9,10 +9,43 @@
 void TelegramService::configure(const String &botToken, const String &chatId) {
   botToken_ = botToken;
   chatId_ = chatId;
+  botToken_.trim();
+  chatId_.trim();
 }
 
 bool TelegramService::isConfigured() const {
-  return botToken_.length() > 0 && chatId_.length() > 0;
+  return validBotToken() && validChatId();
+}
+
+bool TelegramService::validBotToken() const {
+  const int separator = botToken_.indexOf(':');
+  if (separator <= 0 || separator >= static_cast<int>(botToken_.length()) - 1) return false;
+  for (int i = 0; i < separator; ++i) {
+    if (!isdigit(static_cast<unsigned char>(botToken_[i]))) return false;
+  }
+  for (size_t i = separator + 1; i < botToken_.length(); ++i) {
+    const unsigned char c = static_cast<unsigned char>(botToken_[i]);
+    if (!isalnum(c) && c != '_' && c != '-') return false;
+  }
+  return true;
+}
+
+bool TelegramService::validChatId() const {
+  if (chatId_.isEmpty()) return false;
+  const size_t firstDigit = chatId_[0] == '-' ? 1 : 0;
+  if (firstDigit == chatId_.length()) return false;
+  for (size_t i = firstDigit; i < chatId_.length(); ++i) {
+    if (!isdigit(static_cast<unsigned char>(chatId_[i]))) return false;
+  }
+  return true;
+}
+
+String TelegramService::configurationProblem() const {
+  if (botToken_.isEmpty()) return "не задан токен бота";
+  if (!validBotToken()) return "неверный формат токена бота";
+  if (chatId_.isEmpty()) return "не задан числовой chat ID";
+  if (!validChatId()) return "chat ID должен быть числовым";
+  return "";
 }
 
 String TelegramService::apiUrl(const String &method) const {

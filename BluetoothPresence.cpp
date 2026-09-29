@@ -1,25 +1,33 @@
 #include "BluetoothPresence.h"
+#include <ctype.h>
 
 String BluetoothPresence::normalizeMac(String mac) {
   mac.toLowerCase();
+  mac.trim();
   String normalized;
   for (size_t i = 0; i < mac.length(); ++i) {
     const char c = mac[i];
     if (isxdigit(static_cast<unsigned char>(c))) normalized += c;
+    else if (c != ':' && c != '-') return "";
   }
   return normalized;
 }
 
 void BluetoothPresence::begin(const String &targetMac) {
   targetMac_ = normalizeMac(targetMac);
-  if (targetMac_.length() != 12) {
-    Serial.println("BLE-контроль отключён: MAC не задан или имеет неверный формат.");
+  if (targetMac_.length() != 12 || targetMac_ == "000000000000" ||
+      targetMac_ == "ffffffffffff") {
+    Serial.println("BLE отключён: MAC пустой или некорректный; остальные функции продолжают работу.");
     return;
   }
 
+  Serial.println("BLE: инициализация контроллера...");
   BLEDevice::init("");
   scan_ = BLEDevice::getScan();
-  if (scan_ == nullptr) return;
+  if (scan_ == nullptr) {
+    Serial.println("BLE: контроллер не вернул сканер; BLE отключён.");
+    return;
+  }
   scan_->setAdvertisedDeviceCallbacks(this, true);
   scan_->setActiveScan(true);
   scan_->setInterval(100);

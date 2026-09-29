@@ -1,12 +1,13 @@
 /*
  * AI-Thinker ESP32-CAM Guard
- * Firmware version: 1.0.0
+ * Firmware version: 1.1.0
  * Target: AI Thinker ESP32-CAM, Arduino-ESP32 2.0.17
  */
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
+#include <esp_system.h>
 #include <ctype.h>
 #include "Config.h"
 #include "CameraService.h"
@@ -16,7 +17,7 @@
 #include "ScheduleManager.h"
 #include "WebConfigServer.h"
 
-static const char *FIRMWARE_VERSION = "1.0.0";
+static const char *FIRMWARE_VERSION = "1.1.0";
 static const uint32_t WIFI_TIMEOUT_MS = 60000;
 static const uint32_t MOTION_SAMPLE_INTERVAL_MS = 300;
 static const uint32_t TELEGRAM_POLL_INTERVAL_MS = 1800;
@@ -41,24 +42,14 @@ bool previousOwnerPresent = false;
 bool ownerStateInitialized = false;
 bool wasQuiet = false;
 bool otaStarted = false;
+bool cameraReady = false;
+bool telegramConfigurationWarningPrinted = false;
 
 uint32_t pendingMotionPhotos = 0;
 uint32_t pendingManualPhotos = 0;
 uint32_t pendingPeriodicPhotos = 0;
 uint32_t pendingOwnerArrivals = 0;
 uint32_t pendingOwnerDepartures = 0;
-
-static String makeAccessPointPassword() {
-  String mac = WiFi.macAddress();
-  String suffix;
-  for (size_t i = 0; i < mac.length(); ++i) {
-    const char c = mac[i];
-    if (isxdigit(static_cast<unsigned char>(c))) suffix += static_cast<char>(tolower(c));
-  }
-  if (suffix.length() > 6) suffix = suffix.substring(suffix.length() - 6);
-  while (suffix.length() < 6) suffix = "0" + suffix;
-  return "Guard" + suffix;
-}
 
 static String makeAccessPointName() {
   String mac = WiFi.macAddress();
@@ -68,7 +59,35 @@ static String makeAccessPointName() {
     if (isxdigit(static_cast<unsigned char>(c))) suffix += static_cast<char>(toupper(c));
   }
   if (suffix.length() > 6) suffix = suffix.substring(suffix.length() - 6);
+  if (suffix.isEmpty()) suffix = "000000";
   return "Guard-" + suffix;
+}
+
+static String generateDevicePassword() {
+  static const char alphabet[] =
+      "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@$%";
+  String password;
+  password.reserve(20);
+  for (uint8_t i = 0; i < 20; ++i) {
+    password += alphabet[esp_random() % (sizeof(alphabet) - 1)];
+  }
+  return password;
+}
+
+static bool prepareDevicePassword() {
+  if (appConfig.devicePassword.length() >= 12 &&
+      appConfig.devicePassword.length() <= 63) return true;
+
+  appConfig.devicePassword = generateDevicePassword();
+  appConfig.otaEnabled = false;
+  if (!configStore.save(appConfig)) {
+    Serial.println("ОШИБКА: не удалось сохранить пароль устройства в NVS; сеть не запускается.");
+    return false;
+  }
+  Serial.printf("Новый пароль устройства (admin, AP, OTA): %s\n",
+                appConfig.devicePassword.c_str());
+  Serial.println("Сохраните его: повторно он не печатается.");
+  return true;
 }
 
 static void queuePhotos(const String &kind, uint32_t count) {
@@ -84,12 +103,24 @@ static bool canSendNow() {
 }
 
 static void notifyOrQueue(const String &text, bool ownerArrival) {
+  if (!telegramService.isConfigured()) return;
   if (canSendNow() && telegramService.sendMessage(text)) return;
   if (ownerArrival) ++pendingOwnerArrivals;
   else ++pendingOwnerDepartures;
 }
 
 static void sendPhotoBurst(uint8_t count, const String &caption, const String &kind) {
+  if (!telegramService.isConfigured()) {
+    if (!telegramConfigurationWarningPrinted) {
+      Serial.println("Съёмка/отправка пропущена: не заданы токен бота и chat ID.");
+      telegramConfigurationWarningPrinted = true;
+    }
+    return;
+  }
+  if (!cameraReady) {
+    telegramService.sendMessage("Камера не обнаружена; снимки недоступны. Проверьте модуль и шлейф.");
+    return;
+  }
   for (uint8_t i = 0; i < count; ++i) {
     if (!canSendNow()) {
       queuePhotos(kind, count - i);
@@ -118,6 +149,8 @@ static void sendPhotoBurst(uint8_t count, const String &caption, const String &k
 
 static void flushPendingWork() {
   if (!canSendNow()) return;
+  if (!cameraReady &&
+      (pendingMotionPhotos || pendingManualPhotos || pendingPeriodicPhotos)) return;
 
   const bool hasMessages = pendingOwnerArrivals || pendingOwnerDepartures;
   const bool hasPhotos = pendingMotionPhotos || pendingManualPhotos || pendingPeriodicPhotos;
@@ -155,17 +188,13 @@ static void flushPendingWork() {
   }
 }
 
-static void startNetworkAndPortal() {
+static bool startNetworkAndPortal() {
   WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
   WiFi.setSleep(false);
   WiFi.mode(WIFI_STA);
-
-  const String apPassword = makeAccessPointPassword();
-  if (appConfig.webPassword.isEmpty()) {
-    appConfig.webPassword = apPassword;
-    configStore.save(appConfig);
-  }
+  delay(100);  // Start the RF subsystem before requesting hardware random bytes.
+  if (!prepareDevicePassword()) return false;
 
   bool connected = false;
   if (!appConfig.wifiSsid.isEmpty()) {
@@ -187,18 +216,18 @@ static void startNetworkAndPortal() {
     WiFi.disconnect(true);
     WiFi.mode(WIFI_AP);
     const String apName = makeAccessPointName();
-    if (WiFi.softAP(apName.c_str(), apPassword.c_str())) {
-      Serial.printf("Режим настройки: SSID=%s, пароль=%s, адрес http://192.168.4.1/\n",
-                    apName.c_str(), apPassword.c_str());
+    if (WiFi.softAP(apName.c_str(), appConfig.devicePassword.c_str())) {
+      Serial.printf("Режим настройки: SSID=%s, адрес http://192.168.4.1/\n",
+                    apName.c_str());
     } else {
       Serial.println("Не удалось запустить точку доступа.");
     }
   }
 
-  webConfigServer.begin(configStore, appConfig, apPassword);
-  if (connected && appConfig.otaPassword.length() > 0) {
+  webConfigServer.begin(configStore, appConfig);
+  if (connected && appConfig.otaEnabled) {
     ArduinoOTA.setHostname("ai-thinker-guard");
-    ArduinoOTA.setPassword(appConfig.otaPassword.c_str());
+    ArduinoOTA.setPassword(appConfig.devicePassword.c_str());
     ArduinoOTA.onStart([]() { Serial.println("Началась OTA-прошивка."); });
     ArduinoOTA.onEnd([]() { Serial.println("\nOTA-прошивка завершена."); });
     ArduinoOTA.onError([](ota_error_t error) {
@@ -206,10 +235,11 @@ static void startNetworkAndPortal() {
     });
     ArduinoOTA.begin();
     otaStarted = true;
-    Serial.println("OTA включена (порт 3232).");
+    Serial.println("OTA включена (порт 3232); пароль совпадает с паролем устройства.");
   } else if (connected) {
-    Serial.println("OTA выключена: задайте пароль OTA на странице настроек.");
+    Serial.println("OTA выключена в настройках.");
   }
+  return true;
 }
 
 void setup() {
@@ -217,6 +247,7 @@ void setup() {
   delay(300);
   Serial.printf("\nAI-Thinker Guard firmware %s\n", FIRMWARE_VERSION);
 
+  Serial.println("[init] NVS...");
   if (!configStore.begin()) {
     Serial.println("Ошибка открытия NVS. Перезапустите устройство.");
     while (true) delay(1000);
@@ -224,15 +255,30 @@ void setup() {
   configStore.load(appConfig);
   telegramUpdateOffset = configStore.loadUpdateOffset();
 
-  if (!cameraService.begin()) {
-    Serial.println("Ошибка инициализации камеры. Проверьте плату и PSRAM.");
-    while (true) delay(1000);
+  Serial.println("[init] Камера...");
+  cameraReady = cameraService.begin();
+  if (!cameraReady) {
+    Serial.println("Камера недоступна; запуск Wi-Fi и страницы настройки продолжается.");
+  } else {
+    Serial.println("[init] Камера готова.");
   }
 
-  startNetworkAndPortal();
+  Serial.println("[init] Сеть и веб-конфигурация...");
+  if (!startNetworkAndPortal()) {
+    Serial.println("Сеть не запущена, так как не удалось сохранить пароль устройства.");
+    while (true) delay(1000);
+  }
+  Serial.println("[init] Telegram...");
   telegramService.configure(appConfig.telegramToken, appConfig.chatId);
+  if (!telegramService.isConfigured()) {
+    Serial.print("Telegram отключён: ");
+    Serial.println(telegramService.configurationProblem());
+  }
+  Serial.println("[init] NTP/расписание...");
   scheduleManager.begin(appConfig);
+  Serial.println("[init] BLE...");
   bluetoothPresence.begin(appConfig.ownerMac);
+  Serial.println("[init] BLE обработан.");
   previousOwnerPresent = bluetoothPresence.isPresent();
   ownerStateInitialized = true;
   wasQuiet = scheduleManager.isQuietNow();
@@ -279,7 +325,8 @@ void loop() {
     }
   }
 
-  if (now - lastMotionSampleMs >= MOTION_SAMPLE_INTERVAL_MS) {
+  if (cameraReady && telegramService.isConfigured() &&
+      now - lastMotionSampleMs >= MOTION_SAMPLE_INTERVAL_MS) {
     lastMotionSampleMs = now;
     camera_fb_t *frame = cameraService.captureMotionFrame();
     if (frame != nullptr) {
@@ -296,7 +343,8 @@ void loop() {
   }
 
   const uint32_t periodicMs = static_cast<uint32_t>(appConfig.periodicMinutes) * 60000UL;
-  if (now - lastPeriodicCaptureMs >= periodicMs) {
+  if (cameraReady && telegramService.isConfigured() &&
+      now - lastPeriodicCaptureMs >= periodicMs) {
     lastPeriodicCaptureMs = now;
     sendPhotoBurst(1, "Плановый снимок", "periodic");
   }

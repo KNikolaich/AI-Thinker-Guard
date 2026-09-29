@@ -1,10 +1,64 @@
 #include "WebConfigServer.h"
+#include <ctype.h>
+#include <stdlib.h>
 
-void WebConfigServer::begin(ConfigStore &store, AppConfig &config,
-                            const String &fallbackPassword) {
+static bool parseIntegerValue(String value, long &parsed) {
+  value.trim();
+  if (value.isEmpty()) return false;
+  char *end = nullptr;
+  parsed = strtol(value.c_str(), &end, 10);
+  return end != value.c_str() && *end == '\0';
+}
+
+static bool isValidClockValue(const String &value) {
+  if (value.length() != 5 || value[2] != ':') return false;
+  for (size_t i = 0; i < value.length(); ++i) {
+    if (i == 2) continue;
+    if (!isdigit(static_cast<unsigned char>(value[i]))) return false;
+  }
+  const int hour = value.substring(0, 2).toInt();
+  const int minute = value.substring(3, 5).toInt();
+  return hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59;
+}
+
+static bool isValidMacValue(String value) {
+  value.trim();
+  if (value.isEmpty()) return true;
+  String hex;
+  for (size_t i = 0; i < value.length(); ++i) {
+    const char c = value[i];
+    if (isxdigit(static_cast<unsigned char>(c))) hex += static_cast<char>(tolower(c));
+    else if (c != ':' && c != '-') return false;
+  }
+  return hex.length() == 12 && hex != "000000000000" && hex != "ffffffffffff";
+}
+
+static bool isValidBotTokenValue(const String &token) {
+  const int separator = token.indexOf(':');
+  if (separator <= 0 || separator >= static_cast<int>(token.length()) - 1) return false;
+  for (int i = 0; i < separator; ++i) {
+    if (!isdigit(static_cast<unsigned char>(token[i]))) return false;
+  }
+  for (size_t i = separator + 1; i < token.length(); ++i) {
+    const unsigned char c = static_cast<unsigned char>(token[i]);
+    if (!isalnum(c) && c != '_' && c != '-') return false;
+  }
+  return true;
+}
+
+static bool isValidChatIdValue(const String &chatId) {
+  if (chatId.isEmpty() || chatId.length() > 20) return false;
+  const size_t firstDigit = chatId[0] == '-' ? 1 : 0;
+  if (firstDigit == chatId.length()) return false;
+  for (size_t i = firstDigit; i < chatId.length(); ++i) {
+    if (!isdigit(static_cast<unsigned char>(chatId[i]))) return false;
+  }
+  return true;
+}
+
+void WebConfigServer::begin(ConfigStore &store, AppConfig &config) {
   store_ = &store;
   config_ = &config;
-  fallbackPassword_ = fallbackPassword;
   server_.on("/", HTTP_GET, [this]() { handleRoot(); });
   server_.on("/save", HTTP_POST, [this]() { handleSave(); });
   server_.onNotFound([this]() {
@@ -20,10 +74,8 @@ void WebConfigServer::handleClient() {
 
 bool WebConfigServer::authenticate() {
   if (config_ == nullptr) return false;
-  const String &password = config_->webPassword.isEmpty()
-                               ? fallbackPassword_
-                               : config_->webPassword;
-  if (server_.authenticate("admin", password.c_str())) return true;
+  if (config_->devicePassword.length() >= 12 &&
+      server_.authenticate("admin", config_->devicePassword.c_str())) return true;
   server_.requestAuthentication(BASIC_AUTH, "AI-Thinker Guard");
   return false;
 }
@@ -44,8 +96,12 @@ String WebConfigServer::textField(const String &label, const String &name,
 }
 
 String WebConfigServer::passwordField(const String &label, const String &name) const {
+  const String constraints = name == "devicePassword"
+                                 ? " minlength=\"12\" maxlength=\"63\""
+                                 : "";
   return "<label>" + label + "<input type=\"password\" name=\"" + name +
-         "\" value=\"\" placeholder=\"пусто — оставить без изменений\"></label>";
+         "\" value=\"\" placeholder=\"пусто — оставить без изменений\"" +
+         constraints + "></label>";
 }
 
 void WebConfigServer::handleRoot() {
@@ -100,9 +156,11 @@ button{background:#1769aa;color:white;border:0;border-radius:8px;padding:13px 20
                     String(config_->timezoneOffsetMinutes), "number");
   page += R"HTML(<p class="note">В тихие часы события копятся счётчиками в RAM. Изображения не сохраняются; после тишины отправляется сводка и один свежий кадр.</p>
 <h2>Доступ и OTA</h2>)HTML";
-  page += passwordField("Новый пароль веб-страницы (пользователь admin)", "webPassword");
-  page += passwordField("Пароль OTA (пусто — OTA выключена)", "otaPassword");
-  page += R"HTML(<p class="note warn">Пароль точки доступа выводится в Serial Monitor при запуске в режиме AP. Установите собственные пароли веб-доступа и OTA.</p>
+  page += passwordField("Новый общий пароль устройства (минимум 12 символов)", "devicePassword");
+  page += R"HTML(<label class="check"><input type="checkbox" name="otaEnabled" value="1")HTML";
+  if (config_->otaEnabled) page += " checked";
+  page += R"HTML(> Разрешить OTA-прошивку с этим же паролем</label>
+<p class="note warn">Один пароль используется для сети настройки, веб-страницы admin и OTA. OTA по умолчанию выключена. Пароль не отображается на странице; сохраните его отдельно.</p>
 <button type="submit">Сохранить и перезапустить</button></form></main></body></html>)HTML";
   server_.send(200, "text/html; charset=utf-8", page);
 }
@@ -125,22 +183,79 @@ void WebConfigServer::handleSave() {
     next.wifiPassword = server_.arg("wifiPassword");
   if (server_.hasArg("telegramToken") && server_.arg("telegramToken").length())
     next.telegramToken = server_.arg("telegramToken");
-  if (server_.hasArg("webPassword") && server_.arg("webPassword").length())
-    next.webPassword = server_.arg("webPassword");
-  if (server_.hasArg("otaPassword") && server_.arg("otaPassword").length())
-    next.otaPassword = server_.arg("otaPassword");
+
+  if (next.wifiSsid.length() > 32 ||
+      (next.wifiPassword.length() > 0 &&
+       (next.wifiPassword.length() < 8 || next.wifiPassword.length() > 64))) {
+    server_.send(400, "text/plain; charset=utf-8",
+                 "Проверьте Wi-Fi: SSID до 32 символов, пароль 8–64 символа.");
+    return;
+  }
+  if (!next.telegramToken.isEmpty() &&
+      (next.telegramToken.length() > 128 || !isValidBotTokenValue(next.telegramToken))) {
+    server_.send(400, "text/plain; charset=utf-8",
+                 "Токен Telegram имеет неверный формат. Он должен содержать числовой ID и двоеточие.");
+    return;
+  }
+  if (!next.chatId.isEmpty() && !isValidChatIdValue(next.chatId)) {
+    server_.send(400, "text/plain; charset=utf-8",
+                 "chat ID должен быть числом, например отрицательным ID группы.");
+    return;
+  }
+  if (!isValidMacValue(next.ownerMac)) {
+    server_.send(400, "text/plain; charset=utf-8",
+                 "MAC должен содержать 12 шестнадцатеричных цифр; оставьте поле пустым, чтобы отключить BLE.");
+    return;
+  }
+
+  const String requestedDevicePassword = server_.arg("devicePassword");
+  if (requestedDevicePassword.length() > 0) {
+    if (requestedDevicePassword.length() < 12 || requestedDevicePassword.length() > 63) {
+      server_.send(400, "text/plain; charset=utf-8",
+                   "Пароль устройства должен содержать от 12 до 63 символов.");
+      return;
+    }
+    next.devicePassword = requestedDevicePassword;
+  }
+  next.otaEnabled = server_.hasArg("otaEnabled");
 
   next.quietEnabled = server_.hasArg("quietEnabled");
-  long number = server_.arg("motionCount").toInt();
-  if (number >= 1 && number <= 5) next.motionCount = static_cast<uint8_t>(number);
-  number = server_.arg("manualCount").toInt();
-  if (number >= 1 && number <= 5) next.manualCount = static_cast<uint8_t>(number);
-  number = server_.arg("periodicMinutes").toInt();
-  if (number >= 1 && number <= 1440) next.periodicMinutes = static_cast<uint16_t>(number);
-  number = server_.arg("timeoutSeconds").toInt();
-  if (number >= 1 && number <= 86400) next.timeoutSeconds = static_cast<uint32_t>(number);
-  number = server_.arg("timezoneOffsetMinutes").toInt();
-  if (number >= -720 && number <= 840) next.timezoneOffsetMinutes = static_cast<int16_t>(number);
+  long number = 0;
+  if (!parseIntegerValue(server_.arg("motionCount"), number) || number < 1 || number > 5) {
+    server_.send(400, "text/plain; charset=utf-8", "N должно быть от 1 до 5.");
+    return;
+  }
+  next.motionCount = static_cast<uint8_t>(number);
+  if (!parseIntegerValue(server_.arg("manualCount"), number) || number < 1 || number > 5) {
+    server_.send(400, "text/plain; charset=utf-8", "M должно быть от 1 до 5.");
+    return;
+  }
+  next.manualCount = static_cast<uint8_t>(number);
+  if (!parseIntegerValue(server_.arg("periodicMinutes"), number) ||
+      number < 1 || number > 1440) {
+    server_.send(400, "text/plain; charset=utf-8", "X должно быть от 1 до 1440 минут.");
+    return;
+  }
+  next.periodicMinutes = static_cast<uint16_t>(number);
+  if (!parseIntegerValue(server_.arg("timeoutSeconds"), number) ||
+      number < 1 || number > 86400) {
+    server_.send(400, "text/plain; charset=utf-8", "TO должно быть от 1 до 86400 секунд.");
+    return;
+  }
+  next.timeoutSeconds = static_cast<uint32_t>(number);
+  if (!parseIntegerValue(server_.arg("timezoneOffsetMinutes"), number) ||
+      number < -720 || number > 840) {
+    server_.send(400, "text/plain; charset=utf-8", "Часовой пояс должен быть в диапазоне от -720 до 840 минут.");
+    return;
+  }
+  next.timezoneOffsetMinutes = static_cast<int16_t>(number);
+  if (next.quietEnabled &&
+      (!isValidClockValue(next.quietStart) || !isValidClockValue(next.quietEnd) ||
+       next.quietStart == next.quietEnd)) {
+    server_.send(400, "text/plain; charset=utf-8",
+                 "Для тихих часов задайте разные значения времени в формате ЧЧ:ММ.");
+    return;
+  }
 
   if (!store_->save(next)) {
     server_.send(500, "text/plain; charset=utf-8", "Не удалось сохранить настройки");

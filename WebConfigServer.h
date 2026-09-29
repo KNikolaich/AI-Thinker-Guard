@@ -6,7 +6,7 @@
 
 class WebConfigServer {
  public:
-  void begin(ConfigStore &store, AppConfig &config, const String &fallbackPassword);
+  void begin(ConfigStore &store, AppConfig &config);
   void handleClient();
 
  private:
@@ -20,5 +20,4 @@ class WebConfigServer {
   WebServer server_{80};
   ConfigStore *store_ = nullptr;
   AppConfig *config_ = nullptr;
-  String fallbackPassword_;
 };
