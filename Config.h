@@ -8,7 +8,13 @@ struct AppConfig {
   String wifiPassword;
   String telegramToken;
   String chatId;
-  String ownerMac;
+  // Адрес API Telegram: host[:port][/префикс]. Пусто — api.telegram.org.
+  // Нужен для работы через свой прокси, если Telegram заблокирован.
+  String telegramApiHost;
+  // IP телефона капитана в домашней Wi-Fi сети (пусто — функция выключена).
+  String ownerIp;
+  // Сколько минут телефон может молчать, прежде чем «капитан ушёл».
+  uint16_t ownerAwayMinutes = 10;
   String devicePassword;
   // false — пароль по умолчанию, вычисляемый из MAC (Guard + 5 цифр).
   bool devicePasswordCustom = false;

@@ -29,7 +29,11 @@ void ConfigStore::load(AppConfig &config) {
   config.wifiPassword = preferences_.getString("wifiPass", "");
   config.telegramToken = preferences_.getString("tgToken", "");
   config.chatId = preferences_.getString("chatId", "");
-  config.ownerMac = preferences_.getString("ownerMac", "");
+  config.telegramApiHost = preferences_.getString("tgHost", "");
+  config.ownerIp = preferences_.getString("ownerIp", "");
+  config.ownerAwayMinutes = preferences_.getUShort("ownerAway", 10);
+  // Хвост версий с Bluetooth: MAC больше не используется.
+  if (preferences_.isKey("ownerMac")) preferences_.remove("ownerMac");
   if (preferences_.isKey("devicePass")) {
     config.devicePassword = preferences_.getString("devicePass", "");
   } else {
@@ -59,7 +63,9 @@ bool ConfigStore::save(const AppConfig &config) {
   ok &= putStringAndVerify(preferences_, "wifiPass", config.wifiPassword);
   ok &= putStringAndVerify(preferences_, "tgToken", config.telegramToken);
   ok &= putStringAndVerify(preferences_, "chatId", config.chatId);
-  ok &= putStringAndVerify(preferences_, "ownerMac", config.ownerMac);
+  ok &= putStringAndVerify(preferences_, "tgHost", config.telegramApiHost);
+  ok &= putStringAndVerify(preferences_, "ownerIp", config.ownerIp);
+  ok &= preferences_.putUShort("ownerAway", config.ownerAwayMinutes) > 0;
   ok &= putStringAndVerify(preferences_, "devicePass", config.devicePassword);
   ok &= preferences_.putBool("passCustom", config.devicePasswordCustom) > 0;
   ok &= preferences_.putBool("otaEnabled", config.otaEnabled) > 0;

@@ -19,12 +19,18 @@ class WebConfigServer {
   // Вызывается прямо перед намеренным перезапуском из веб-панели.
   void setBeforeRestart(std::function<void()> callback) { beforeRestart_ = callback; }
   void setFirmwareVersion(const char *version) { firmwareVersion_ = version; }
+  void setDeviceName(const String &name) { deviceName_ = name; }
 
  private:
   void handleRoot();
   void handleSave();
   void handleRetry();
   void handleUpdatePage();
+  void handleConfigPage();
+  void handleConfigExport();
+  void handleConfigImport();
+  bool storeAndRestart(const AppConfig &next, const String &message);
+  String menuHtml() const;
   void handleUpdateUpload();
   void handleUpdateDone();
   bool updateAllowed();
@@ -41,6 +47,7 @@ class WebConfigServer {
   AppConfig *config_ = nullptr;
   bool apProtected_ = false;
   const char *firmwareVersion_ = "";
+  String deviceName_ = "guard";
   String uploadError_;
   bool uploadStarted_ = false;
   std::function<String()> statusProvider_;
