@@ -1,5 +1,7 @@
 #include "Config.h"
 
+#include <nvs_flash.h>
+
 static bool putStringAndVerify(Preferences &preferences, const char *key,
                                const String &value) {
   preferences.putString(key, value);
@@ -7,7 +9,19 @@ static bool putStringAndVerify(Preferences &preferences, const char *key,
 }
 
 bool ConfigStore::begin() {
-  return preferences_.begin("guard", false);
+  ready_ = preferences_.begin("guard", false);
+  if (ready_) return true;
+
+  // Раздел NVS повреждён или не инициализирован: пробуем восстановить его.
+  // Настройки при этом теряются, но устройство остаётся управляемым.
+  Serial.println("NVS: не удалось открыть раздел, выполняю очистку и повторную инициализацию...");
+  nvs_flash_deinit();
+  const esp_err_t eraseResult = nvs_flash_erase();
+  const esp_err_t initResult = nvs_flash_init();
+  Serial.printf("NVS: erase=0x%x init=0x%x\n", static_cast<unsigned>(eraseResult),
+                static_cast<unsigned>(initResult));
+  ready_ = preferences_.begin("guard", false);
+  return ready_;
 }
 
 void ConfigStore::load(AppConfig &config) {
@@ -26,6 +40,7 @@ void ConfigStore::load(AppConfig &config) {
       preferences_.remove("otaPass");
     }
   }
+  config.devicePasswordCustom = preferences_.getBool("passCustom", false);
   config.motionCount = preferences_.getUChar("motionN", 3);
   config.manualCount = preferences_.getUChar("manualM", 3);
   config.periodicMinutes = preferences_.getUShort("periodX", 30);
@@ -38,6 +53,7 @@ void ConfigStore::load(AppConfig &config) {
 }
 
 bool ConfigStore::save(const AppConfig &config) {
+  if (!ready_) return false;
   bool ok = true;
   ok &= putStringAndVerify(preferences_, "wifiSsid", config.wifiSsid);
   ok &= putStringAndVerify(preferences_, "wifiPass", config.wifiPassword);
@@ -45,6 +61,7 @@ bool ConfigStore::save(const AppConfig &config) {
   ok &= putStringAndVerify(preferences_, "chatId", config.chatId);
   ok &= putStringAndVerify(preferences_, "ownerMac", config.ownerMac);
   ok &= putStringAndVerify(preferences_, "devicePass", config.devicePassword);
+  ok &= preferences_.putBool("passCustom", config.devicePasswordCustom) > 0;
   ok &= preferences_.putBool("otaEnabled", config.otaEnabled) > 0;
   ok &= preferences_.putUChar("motionN", config.motionCount) > 0;
   ok &= preferences_.putUChar("manualM", config.manualCount) > 0;
@@ -57,10 +74,16 @@ bool ConfigStore::save(const AppConfig &config) {
   return ok;
 }
 
+bool ConfigStore::clearAll() {
+  if (!ready_) return false;
+  return preferences_.clear();
+}
+
 int64_t ConfigStore::loadUpdateOffset() {
   return preferences_.getLong64("tgOffset", 0);
 }
 
 void ConfigStore::saveUpdateOffset(int64_t offset) {
+  if (!ready_) return;
   preferences_.putLong64("tgOffset", offset);
 }

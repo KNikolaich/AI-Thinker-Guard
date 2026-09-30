@@ -1,6 +1,12 @@
 #include "CameraService.h"
 
-bool CameraService::begin() {
+bool CameraService::initWith(pixformat_t format, framesize_t size, Mode mode) {
+  if (mode_ != Mode::Off) {
+    esp_camera_deinit();
+    mode_ = Mode::Off;
+    delay(20);
+  }
+
   camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -21,49 +27,68 @@ bool CameraService::begin() {
   config.pin_pwdn = 32;
   config.pin_reset = -1;
   config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_GRAYSCALE;
-  config.frame_size = FRAMESIZE_QQVGA;
+  config.pixel_format = format;
+  config.frame_size = size;
   config.jpeg_quality = 12;
   config.fb_count = 1;
   config.fb_location = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
-  return esp_camera_init(&config) == ESP_OK;
+  const esp_err_t result = esp_camera_init(&config);
+  if (result != ESP_OK) {
+    lastError_ = "esp_camera_init: 0x" + String(static_cast<unsigned>(result), HEX);
+    return false;
+  }
+  lastError_ = "";
+  mode_ = mode;
+  return true;
+}
+
+bool CameraService::begin() {
+  return enterMotionMode();
+}
+
+void CameraService::end() {
+  if (mode_ != Mode::Off) esp_camera_deinit();
+  mode_ = Mode::Off;
 }
 
 camera_fb_t *CameraService::captureMotionFrame() {
-  if (photoMode_) return nullptr;
+  if (mode_ != Mode::Motion) return nullptr;
   return esp_camera_fb_get();
 }
 
-void CameraService::releaseMotionFrame(camera_fb_t *frame) {
-  if (frame != nullptr) esp_camera_fb_return(frame);
+bool CameraService::enterMotionMode() {
+  if (mode_ == Mode::Motion) return true;
+  return initWith(PIXFORMAT_GRAYSCALE, FRAMESIZE_QQVGA, Mode::Motion);
 }
 
-camera_fb_t *CameraService::takePhoto() {
-  if (photoMode_) return nullptr;
-  sensor_t *sensor = esp_camera_sensor_get();
-  if (sensor == nullptr) return nullptr;
-  photoMode_ = true;
-  sensor->set_framesize(sensor, FRAMESIZE_VGA);
-  sensor->set_pixformat(sensor, PIXFORMAT_JPEG);
-  delay(180);
+bool CameraService::enterPhotoMode() {
+  if (mode_ == Mode::Photo) return true;
+  // Без PSRAM буфер VGA JPEG может не поместиться во внутреннюю память.
+  const framesize_t size = psramFound() ? FRAMESIZE_VGA : FRAMESIZE_QVGA;
+  if (!initWith(PIXFORMAT_JPEG, size, Mode::Photo)) return false;
+  // Первые кадры после старта сенсора тёмные: даём автоэкспозиции подстроиться.
+  for (uint8_t i = 0; i < 3; ++i) {
+    camera_fb_t *warmup = esp_camera_fb_get();
+    if (warmup != nullptr) esp_camera_fb_return(warmup);
+    delay(60);
+  }
+  return true;
+}
+
+camera_fb_t *CameraService::capturePhoto() {
+  if (mode_ != Mode::Photo) return nullptr;
   camera_fb_t *frame = esp_camera_fb_get();
-  if (frame == nullptr) restoreMotionMode();
+  if (frame != nullptr && frame->format != PIXFORMAT_JPEG) {
+    esp_camera_fb_return(frame);
+    lastError_ = "кадр получен не в формате JPEG";
+    return nullptr;
+  }
+  if (frame == nullptr) lastError_ = "esp_camera_fb_get вернул пустой кадр";
   return frame;
 }
 
-void CameraService::releasePhoto(camera_fb_t *frame) {
+void CameraService::releaseFrame(camera_fb_t *frame) {
   if (frame != nullptr) esp_camera_fb_return(frame);
-  restoreMotionMode();
-}
-
-void CameraService::restoreMotionMode() {
-  sensor_t *sensor = esp_camera_sensor_get();
-  if (sensor != nullptr) {
-    sensor->set_framesize(sensor, FRAMESIZE_QQVGA);
-    sensor->set_pixformat(sensor, PIXFORMAT_GRAYSCALE);
-  }
-  photoMode_ = false;
-  delay(40);
 }

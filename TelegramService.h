@@ -11,8 +11,16 @@ class TelegramService {
   bool sendMessage(const String &text);
   bool sendPhoto(camera_fb_t *frame, const String &caption);
   bool pollCommand(int64_t &nextOffset, String &command);
+  String lastResult() const;
+  bool lastRequestOk() const { return lastStatus_ == 200; }
 
  private:
+  void noteResult(int status, const char *operation);
+  int lastStatus_ = 0;
+  String lastOperation_;
+  uint32_t lastResultMs_ = 0;
+  uint32_t lastSuccessMs_ = 0;
+
   String botToken_;
   String chatId_;
   bool validBotToken() const;
