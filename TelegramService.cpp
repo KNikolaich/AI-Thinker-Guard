@@ -224,6 +224,9 @@ bool TelegramService::publishCommands() {
   const String body =
       "{\"commands\":["
       "{\"command\":\"getcapture\",\"description\":\"Сделать снимок сейчас\"},"
+      "{\"command\":\"arm\",\"description\":\"Поставить на охрану\"},"
+      "{\"command\":\"disarm\",\"description\":\"Снять с охраны\"},"
+      "{\"command\":\"periodic\",\"description\":\"Плановые снимки: on или off\"},"
       "{\"command\":\"status\",\"description\":\"Состояние камеры\"},"
       "{\"command\":\"help\",\"description\":\"Что умеет камера\"}]}";
   return postJson("setMyCommands", body, "setMyCommands");
@@ -455,16 +458,29 @@ bool TelegramService::pollCommand(int64_t &nextOffset, TelegramCommand &command)
     if (text.startsWith("/")) text.remove(0, 1);
     const int mentionAt = text.indexOf('@');
     if (mentionAt >= 0) text = text.substring(0, mentionAt);
+    // «/arm скворечник» -> команда «arm», аргумент «скворечник».
+    String arg;
     const int spaceAt = text.indexOf(' ');
-    if (spaceAt >= 0) text = text.substring(0, spaceAt);
+    if (spaceAt >= 0) {
+      arg = text.substring(spaceAt + 1);
+      arg.trim();
+      text = text.substring(0, spaceAt);
+    }
     text.toLowerCase();
+    // Кнопки присылают «periodic_on» и т.п.
+    if (text == "periodic_on") { text = "periodic"; arg = "on"; }
+    if (text == "periodic_off") { text = "periodic"; arg = "off"; }
 
     command.chatId = chatId;
     command.callbackId = callbackId;
+    command.arg = arg;
     if (text == "getcapture" || text == "capture" || text == "photo") command.name = "getcapture";
     else if (text == "status") command.name = "status";
     else if (text == "start") command.name = "start";
     else if (text == "help") command.name = "help";
+    else if (text == "arm") command.name = "arm";
+    else if (text == "disarm") command.name = "disarm";
+    else if (text == "periodic") command.name = "periodic";
     else command.name = "unknown";
     return true;
   }

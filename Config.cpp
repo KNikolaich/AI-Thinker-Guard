@@ -25,6 +25,13 @@ bool ConfigStore::begin() {
 }
 
 void ConfigStore::load(AppConfig &config) {
+  config.deviceName = preferences_.getString("devName", "");
+  config.mqttHost = preferences_.getString("mqttHost", "");
+  config.mqttPort = preferences_.getUShort("mqttPort", 8883);
+  config.mqttUser = preferences_.getString("mqttUser", "");
+  config.mqttPassword = preferences_.getString("mqttPass", "");
+  config.armed = preferences_.getBool("armed", true);
+  config.periodicEnabled = preferences_.getBool("periodicOn", true);
   config.wifiSsid = preferences_.getString("wifiSsid", "");
   config.wifiPassword = preferences_.getString("wifiPass", "");
   config.telegramToken = preferences_.getString("tgToken", "");
@@ -59,6 +66,12 @@ void ConfigStore::load(AppConfig &config) {
 bool ConfigStore::save(const AppConfig &config) {
   if (!ready_) return false;
   bool ok = true;
+  ok &= putStringAndVerify(preferences_, "devName", config.deviceName);
+  ok &= putStringAndVerify(preferences_, "mqttHost", config.mqttHost);
+  ok &= preferences_.putUShort("mqttPort", config.mqttPort) > 0;
+  ok &= putStringAndVerify(preferences_, "mqttUser", config.mqttUser);
+  ok &= putStringAndVerify(preferences_, "mqttPass", config.mqttPassword);
+  ok &= saveModes(config);
   ok &= putStringAndVerify(preferences_, "wifiSsid", config.wifiSsid);
   ok &= putStringAndVerify(preferences_, "wifiPass", config.wifiPassword);
   ok &= putStringAndVerify(preferences_, "tgToken", config.telegramToken);
@@ -77,6 +90,13 @@ bool ConfigStore::save(const AppConfig &config) {
   ok &= putStringAndVerify(preferences_, "quietStart", config.quietStart);
   ok &= putStringAndVerify(preferences_, "quietEnd", config.quietEnd);
   ok &= preferences_.putShort("tzOffset", config.timezoneOffsetMinutes) > 0;
+  return ok;
+}
+
+bool ConfigStore::saveModes(const AppConfig &config) {
+  if (!ready_) return false;
+  bool ok = preferences_.putBool("armed", config.armed) > 0;
+  ok &= preferences_.putBool("periodicOn", config.periodicEnabled) > 0;
   return ok;
 }
 

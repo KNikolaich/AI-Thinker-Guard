@@ -1,0 +1,14 @@
+[Unit]
+Description=Swarm hub: Telegram bot for ESP32 devices
+After=network-online.target mosquitto.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/swarm-hub/swarm_hub.py /etc/swarm-hub/config.json
+Restart=always
+RestartSec=5
+User=swarmhub
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

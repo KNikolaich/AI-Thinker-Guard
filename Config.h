@@ -4,6 +4,16 @@
 #include <Preferences.h>
 
 struct AppConfig {
+  // Имя устройства для людей: «Скворечник», «Калитка». Пусто — используется ID.
+  String deviceName;
+  // MQTT-брокер хаба роя. Пусто — устройство само работает с Telegram.
+  String mqttHost;
+  uint16_t mqttPort = 8883;
+  String mqttUser;
+  String mqttPassword;
+  // Режимы, которые меняются командами (сохраняются при перезагрузке).
+  bool armed = true;            // на охране: тревоги по движению отправляются
+  bool periodicEnabled = true;  // плановые снимки включены
   String wifiSsid;
   String wifiPassword;
   String telegramToken;
@@ -35,6 +45,8 @@ class ConfigStore {
   bool ready() const { return ready_; }
   void load(AppConfig &config);
   bool save(const AppConfig &config);
+  // Быстрое сохранение только режимов (охрана, плановые снимки).
+  bool saveModes(const AppConfig &config);
   bool clearAll();  // сброс всех настроек в NVS
   int64_t loadUpdateOffset();
   void saveUpdateOffset(int64_t offset);

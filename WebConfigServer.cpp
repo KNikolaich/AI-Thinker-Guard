@@ -54,7 +54,34 @@ static bool isValidBotTokenValue(const String &token) {
 
 // Единая проверка настроек: для формы и для загруженного JSON.
 // Пустая строка = всё в порядке, иначе текст ошибки для пользователя.
+static bool isValidHostValue(const String &value) {
+  if (value.isEmpty() || value.length() > 63) return false;
+  for (size_t i = 0; i < value.length(); ++i) {
+    const unsigned char ch = static_cast<unsigned char>(value[i]);
+    if (!isalnum(ch) && ch != '.' && ch != '-') return false;
+  }
+  return true;
+}
+
+static bool isPrintableAscii(const String &value, size_t maxLength) {
+  if (value.length() > maxLength) return false;
+  for (size_t i = 0; i < value.length(); ++i) {
+    const unsigned char ch = static_cast<unsigned char>(value[i]);
+    if (ch < 32 || ch > 126) return false;
+  }
+  return true;
+}
+
 static String validateConfig(const AppConfig &c) {
+  if (c.deviceName.length() > 48) return "Имя устройства — до 48 байт (примерно 24 русских буквы).";
+  for (size_t i = 0; i < c.deviceName.length(); ++i) {
+    if (static_cast<unsigned char>(c.deviceName[i]) < 32) return "Имя устройства не должно содержать управляющих символов.";
+  }
+  if (!c.mqttHost.isEmpty() && !isValidHostValue(c.mqttHost))
+    return "Адрес MQTT-брокера: имя хоста или IP без https:// и порта.";
+  if (c.mqttPort == 0) return "Порт MQTT — от 1 до 65535 (обычно 8883 с TLS).";
+  if (!isPrintableAscii(c.mqttUser, 64) || !isPrintableAscii(c.mqttPassword, 64))
+    return "Логин и пароль MQTT — до 64 символов латиницей, цифрами и знаками.";
   if (c.wifiSsid.length() > 32) return "SSID Wi-Fi — до 32 символов.";
   if (c.wifiPassword.length() > 0 && (c.wifiPassword.length() < 8 || c.wifiPassword.length() > 64))
     return "Пароль Wi-Fi — от 8 до 64 символов.";
@@ -224,10 +251,25 @@ nav{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 18px}nav a{background:#e8eef4
   page += menuHtml();
   page += statusHtml();
   page += R"HTML(<form method="post" action="/save">
+<h2>Устройство</h2>)HTML";
+  page += textField("Имя устройства (например, Скворечник; пусто — ID)", "deviceName", config_->deviceName);
+  page += R"HTML(<label class="check"><input type="checkbox" name="armed" value="1")HTML";
+  if (config_->armed) page += " checked";
+  page += R"HTML(> На охране (тревоги по движению)</label>
+<label class="check"><input type="checkbox" name="periodicEnabled" value="1")HTML";
+  if (config_->periodicEnabled) page += " checked";
+  page += R"HTML(> Плановые снимки включены</label>
+<h2>Хаб роя (MQTT)</h2><div class="row">)HTML";
+  page += textField("Адрес брокера (пусто — прямой режим Telegram)", "mqttHost", config_->mqttHost);
+  page += textField("Порт (8883 — TLS, 1883 — без шифрования)", "mqttPort", String(config_->mqttPort), "number");
+  page += "</div><div class=\"row\">";
+  page += textField("Логин MQTT", "mqttUser", config_->mqttUser);
+  page += passwordField("Пароль MQTT", "mqttPassword");
+  page += R"HTML(</div><p class="note">С хабом устройство общается только с брокером на вашем сервере, а Telegram-бот хаба управляет всеми устройствами сразу. Поля Telegram ниже тогда не используются.</p>
 <h2>Wi-Fi</h2>)HTML";
   page += textField("Имя сети (SSID)", "wifiSsid", config_->wifiSsid);
   page += passwordField("Пароль Wi-Fi", "wifiPassword");
-  page += R"HTML(<h2>Telegram</h2>)HTML";
+  page += R"HTML(<h2>Telegram (прямой режим, без хаба)</h2>)HTML";
   page += passwordField("Токен бота", "telegramToken");
   page += textField("ID чатов через запятую (до 5)", "chatId", config_->chatId);
   page += textField("Адрес API Telegram (пусто — api.telegram.org)", "telegramApiHost",
@@ -281,6 +323,30 @@ void WebConfigServer::handleSave() {
   }
 
   AppConfig next = *config_;
+  if (server_.hasArg("deviceName")) {
+    next.deviceName = server_.arg("deviceName");
+    next.deviceName.trim();
+  }
+  if (server_.hasArg("mqttHost")) {
+    next.mqttHost = server_.arg("mqttHost");
+    next.mqttHost.trim();
+  }
+  if (server_.hasArg("mqttUser")) {
+    next.mqttUser = server_.arg("mqttUser");
+    next.mqttUser.trim();
+  }
+  if (server_.hasArg("mqttPassword") && server_.arg("mqttPassword").length())
+    next.mqttPassword = server_.arg("mqttPassword");
+  next.armed = server_.hasArg("armed");
+  next.periodicEnabled = server_.hasArg("periodicEnabled");
+  {
+    long port = 0;
+    if (!parseIntegerValue(server_.arg("mqttPort"), port) || port < 1 || port > 65535) {
+      server_.send(400, "text/plain; charset=utf-8", "Порт MQTT — число от 1 до 65535.");
+      return;
+    }
+    next.mqttPort = static_cast<uint16_t>(port);
+  }
   if (server_.hasArg("wifiSsid")) next.wifiSsid = server_.arg("wifiSsid");
   if (server_.hasArg("chatId")) next.chatId = server_.arg("chatId");
   if (server_.hasArg("telegramApiHost")) {
@@ -488,6 +554,13 @@ void WebConfigServer::handleConfigExport() {
   doc["configVersion"] = 1;
   doc["firmware"] = firmwareVersion_;
   doc["device"] = deviceName_;
+  doc["deviceName"] = config_->deviceName;
+  doc["armed"] = config_->armed;
+  doc["periodicEnabled"] = config_->periodicEnabled;
+  doc["mqttHost"] = config_->mqttHost;
+  doc["mqttPort"] = config_->mqttPort;
+  doc["mqttUser"] = config_->mqttUser;
+  doc["mqttPassword"] = config_->mqttPassword;
   doc["wifiSsid"] = config_->wifiSsid;
   doc["wifiPassword"] = config_->wifiPassword;
   doc["telegramToken"] = config_->telegramToken;
@@ -532,6 +605,7 @@ button:disabled{background:#9aa7b3}.warn{background:#fff5d6;padding:12px;border-
 <p class="note warn">В файле есть пароль Wi-Fi и токен бота — храните его как пароль.</p>
 <h2>Загрузить конфиг</h2>
 <p class="note">Файл .json, сохранённый с этой или другой камеры. Поля, которых нет в файле, не меняются.
+Имя устройства (<code>deviceName</code>) лучше удалить из общего файла — иначе все камеры получат одно имя.
 После загрузки камера перезапустится.</p>
 <form id="f"><input type="file" id="file" accept=".json,application/json" required>
 <button id="go" type="submit">Загрузить и применить</button></form><div id="msg"></div>
@@ -593,6 +667,20 @@ void WebConfigServer::handleConfigImport() {
     target = in[key].as<long>();
     return true;
   };
+  text("deviceName", next.deviceName);
+  text("mqttHost", next.mqttHost);
+  text("mqttUser", next.mqttUser);
+  text("mqttPassword", next.mqttPassword);
+  if (in.containsKey("armed")) next.armed = in["armed"].as<bool>();
+  if (in.containsKey("periodicEnabled")) next.periodicEnabled = in["periodicEnabled"].as<bool>();
+  {
+    long port = next.mqttPort;
+    if (!integer("mqttPort", port) || port < 1 || port > 65535) {
+      server_.send(400, "text/plain; charset=utf-8", "mqttPort — число от 1 до 65535.");
+      return;
+    }
+    next.mqttPort = static_cast<uint16_t>(port);
+  }
   text("wifiSsid", next.wifiSsid);
   text("wifiPassword", next.wifiPassword);
   text("telegramToken", next.telegramToken);

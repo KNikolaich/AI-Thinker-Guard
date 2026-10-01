@@ -1,0 +1,10 @@
+# /etc/mosquitto/swarm.acl
+# Хаб видит всё.
+user hub
+topic readwrite swarm/#
+
+# Устройства: свои топики пишут, команды читают.
+user device
+topic readwrite swarm/dev/#
+topic read swarm/type/#
+topic read swarm/all/#

@@ -3,13 +3,9 @@
 #include <Arduino.h>
 #include "esp_camera.h"
 
-// Команда из Telegram: текст (/getcapture, /status, /start, /help …) или
-// нажатие inline-кнопки. chatId — откуда пришла, туда и отвечаем.
-struct TelegramCommand {
-  String name;        // "getcapture", "status", "help", "start" или "unknown"
-  String chatId;
-  String callbackId;  // не пусто, если это нажатие inline-кнопки
-};
+#include "DeviceCommand.h"
+
+using TelegramCommand = DeviceCommand;
 
 class TelegramService {
  public:

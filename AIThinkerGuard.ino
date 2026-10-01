@@ -1,6 +1,6 @@
 /*
  * AI-Thinker ESP32-CAM Guard
- * Firmware version: 1.8.0
+ * Firmware version: 2.0.0
  * Target: AI Thinker ESP32-CAM, Arduino-ESP32 2.0.17
  *
  * Принцип отказоустойчивости: Wi-Fi/точка доступа и страница настроек
@@ -19,6 +19,7 @@
 #include <esp_task_wdt.h>
 #include <esp_heap_caps.h>
 #include <ctype.h>
+#include <ArduinoJson.h>
 #include "SystemHealth.h"
 #include "Config.h"
 #include "CameraService.h"
@@ -27,8 +28,12 @@
 #include "WifiPresence.h"
 #include "ScheduleManager.h"
 #include "WebConfigServer.h"
+#include "MqttLink.h"
+#include "DeviceCommand.h"
 
-static const char *FIRMWARE_VERSION = "1.8.0";
+static const char *FIRMWARE_VERSION = "2.0.0";
+// Тип устройства в рое. Команды для всех «guard» слушают все охранники.
+static const char *DEVICE_TYPE = "guard";
 static const uint32_t WIFI_BOOT_TIMEOUT_MS = 20000;     // ожидание Wi-Fi при старте
 static const uint32_t WIFI_RETRY_INTERVAL_MS = 30000;   // повтор подключения STA
 static const uint32_t WIFI_LOST_AP_DELAY_MS = 30000;    // AP после потери Wi-Fi
@@ -39,6 +44,7 @@ static const uint32_t MOTION_SAMPLE_INTERVAL_MS = 300;
 static const uint32_t TELEGRAM_POLL_INTERVAL_MS = 3000;
 static const uint32_t TELEGRAM_MAX_BACKOFF_MS = 60000;   // пауза опроса без интернета
 static const uint32_t WATCHDOG_TIMEOUT_S = 90;
+static const uint32_t STATE_HEARTBEAT_MS = 60000;      // состояние для хаба не реже раза в минуту
 
 SystemHealth systemHealth;
 ConfigStore configStore;
@@ -50,6 +56,7 @@ WifiPresence ownerPresence;
 ScheduleManager scheduleManager;
 WebConfigServer webConfigServer;
 DNSServer dnsServer;
+MqttLink mqttLink;
 
 int64_t telegramUpdateOffset = 0;
 uint32_t lastMotionSampleMs = 0;
@@ -72,6 +79,12 @@ bool devicePasswordSaved = true;
 String cameraStatus = "не инициализирована";
 String telegramStatus = "не инициализирован";
 
+// Устройство в рое.
+String deviceId;          // guard-xxxxxx, из MAC — не меняется
+bool mqttMode = false;    // true — связь через хаб (MQTT), иначе напрямую с Telegram
+String lastStateSignature;
+uint32_t lastStatePublishMs = 0;
+
 // Состояние Wi-Fi.
 bool staConfigured = false;
 bool staWasConnected = false;
@@ -93,6 +106,7 @@ enum class PhotoKind : uint8_t { Motion, Manual, Periodic };
 
 static void serviceSerialConsole();
 static void printConfiguration();
+static void setArmed(bool armed, const String &source);
 
 // ---------------------------------------------------------------- пароль ---
 
@@ -351,7 +365,49 @@ static void markCameraFailed(const String &reason) {
   Serial.println("Камера: " + cameraStatus);
 }
 
-// --------------------------------------------------------------- Telegram ---
+// ------------------------------------------------- связь: Telegram или хаб ---
+// Всё, что уходит людям, идёт через sendText()/sendPhotoFrame(): в режиме
+// хаба — в MQTT (хаб сам добавит имя устройства и разошлёт по чатам),
+// в прямом режиме — в Telegram, с именем устройства в начале.
+
+static String deviceDisplayName() {
+  return appConfig.deviceName.isEmpty() ? deviceId : appConfig.deviceName;
+}
+
+static bool channelEnabled() {
+  return mqttMode || telegramEnabled;
+}
+
+static bool channelOnline() {
+  if (mqttMode) return mqttLink.connected();
+  return telegramEnabled && WiFi.status() == WL_CONNECTED;
+}
+
+static String withName(const String &text) {
+  if (mqttMode || appConfig.deviceName.isEmpty()) return text;
+  return "[" + appConfig.deviceName + "] " + text;
+}
+
+static bool sendText(const String &text, const char *kind, const String &chat = "") {
+  if (mqttMode) return mqttLink.publishEvent(kind, text, chat);
+  if (!telegramEnabled) return false;
+  return chat.isEmpty() ? telegramService.sendMessage(withName(text))
+                        : telegramService.sendMessageTo(chat, withName(text));
+}
+
+static bool sendPhotoFrame(camera_fb_t *frame, const String &caption, const char *kind,
+                           const String &chat = "") {
+  if (mqttMode) return mqttLink.publishPhoto(frame, caption, kind, chat);
+  if (!telegramEnabled) return false;
+  return chat.isEmpty() ? telegramService.sendPhoto(frame, withName(caption))
+                        : telegramService.sendPhotoTo(chat, frame, withName(caption));
+}
+
+static const char *photoKindName(PhotoKind kind) {
+  if (kind == PhotoKind::Motion) return "motion";
+  if (kind == PhotoKind::Manual) return "manual";
+  return "periodic";
+}
 
 static void queuePhotos(PhotoKind kind, uint32_t count) {
   if (kind == PhotoKind::Motion) pendingMotionPhotos += count;
@@ -360,36 +416,31 @@ static void queuePhotos(PhotoKind kind, uint32_t count) {
 }
 
 static bool canSendNow() {
-  return telegramEnabled && WiFi.status() == WL_CONNECTED &&
-         !scheduleManager.isQuietNow();
+  return channelOnline() && !scheduleManager.isQuietNow();
 }
 
 static void notifyOrQueue(const String &text, bool ownerArrival) {
-  if (!telegramEnabled) return;
-  if (canSendNow() && telegramService.sendMessage(text)) return;
+  if (!channelEnabled()) return;
+  if (canSendNow() && sendText(text, "owner")) return;
   if (ownerArrival) ++pendingOwnerArrivals;
   else ++pendingOwnerDepartures;
 }
 
-// targetChat пусто — всем подписанным чатам; иначе только этому (ответ на
-// команду). Ответ на команду отправляется и в тихие часы: его явно попросили.
+// targetChat пусто — всем; иначе только этому чату (ответ на команду).
+// Ответ на команду отправляется и в тихие часы: его явно попросили.
 static void sendPhotoBurst(uint8_t count, const String &caption, PhotoKind kind,
                            const String &targetChat = "") {
   const bool direct = !targetChat.isEmpty();
-  auto canSend = [&]() {
-    return direct ? (telegramEnabled && WiFi.status() == WL_CONNECTED) : canSendNow();
-  };
-  if (!telegramEnabled) {
+  auto canSend = [&]() { return direct ? channelOnline() : canSendNow(); };
+  if (!channelEnabled()) {
     if (!telegramConfigurationWarningPrinted) {
-      Serial.println("Съёмка/отправка пропущена: Telegram не настроен или отключён.");
+      Serial.println("Съёмка/отправка пропущена: не настроены ни хаб (MQTT), ни Telegram.");
       telegramConfigurationWarningPrinted = true;
     }
     return;
   }
   if (!cameraService.isReady()) {
-    if (direct && canSend()) {
-      telegramService.sendMessageTo(targetChat, "Камера недоступна: " + cameraStatus);
-    }
+    if (direct && canSend()) sendText("Камера недоступна: " + cameraStatus, "reply", targetChat);
     return;
   }
   if (!canSend()) {
@@ -406,17 +457,16 @@ static void sendPhotoBurst(uint8_t count, const String &caption, PhotoKind kind,
     camera_fb_t *frame = cameraService.capturePhoto();
     if (frame == nullptr) {
       Serial.println("Камера: " + cameraService.lastError());
-      if (direct) telegramService.sendMessageTo(targetChat, "Не удалось получить кадр: " + cameraService.lastError());
+      if (direct) sendText("Не удалось получить кадр: " + cameraService.lastError(), "reply", targetChat);
       else queuePhotos(kind, count - i);
       break;
     }
     String photoCaption = caption;
     if (count > 1) photoCaption += " (" + String(i + 1) + "/" + String(count) + ")";
-    const bool sent = direct ? telegramService.sendPhotoTo(targetChat, frame, photoCaption)
-                             : telegramService.sendPhoto(frame, photoCaption);
+    const bool sent = sendPhotoFrame(frame, photoCaption, photoKindName(kind), targetChat);
     cameraService.releaseFrame(frame);
     if (!sent) {
-      Serial.println("Telegram: " + telegramService.lastResult());
+      Serial.println(mqttMode ? "MQTT: снимок не отправлен" : "Telegram: " + telegramService.lastResult());
       if (!direct) queuePhotos(kind, count - i);
       break;
     }
@@ -440,7 +490,7 @@ static void flushPendingWork() {
   if (pendingOwnerArrivals) summary += "\n«Капитан на мостике»: " + String(pendingOwnerArrivals);
   if (pendingOwnerDepartures) summary += "\n«Сторож бдит»: " + String(pendingOwnerDepartures);
   if (pendingMotionPhotos) summary += "\nСнимки по движению: " + String(pendingMotionPhotos);
-  if (pendingManualPhotos) summary += "\nСнимки GetCapture: " + String(pendingManualPhotos);
+  if (pendingManualPhotos) summary += "\nСнимки по запросу: " + String(pendingManualPhotos);
   if (pendingPeriodicPhotos) summary += "\nПлановые снимки: " + String(pendingPeriodicPhotos);
   const bool attachPhoto = hasPhotos && cameraService.isReady();
   if (attachPhoto) {
@@ -449,7 +499,7 @@ static void flushPendingWork() {
     summary += "\nКамера сейчас недоступна: " + cameraStatus;
   }
 
-  if (!telegramService.sendMessage(summary)) return;
+  if (!sendText(summary, "summary")) return;
   // Сводка доставлена — счётчики обнуляем, чтобы не присылать её повторно.
   pendingOwnerArrivals = 0;
   pendingOwnerDepartures = 0;
@@ -460,7 +510,7 @@ static void flushPendingWork() {
   if (attachPhoto) {
     camera_fb_t *frame = cameraService.capturePhoto();
     if (frame != nullptr) {
-      telegramService.sendPhoto(frame, "Актуальный кадр");
+      sendPhotoFrame(frame, "Актуальный кадр", "summary");
       cameraService.releaseFrame(frame);
     }
     motionDetector.reset();
@@ -481,6 +531,67 @@ static void initTelegram() {
   } else {
     telegramStatus = "отключён: " + telegramService.configurationProblem();
     Serial.println("Telegram " + telegramStatus);
+  }
+}
+
+static void initChannel() {
+  if (!appConfig.mqttHost.isEmpty()) {
+    mqttMode = true;
+    mqttLink.configure(appConfig.mqttHost, appConfig.mqttPort, appConfig.mqttUser,
+                       appConfig.mqttPassword, deviceId, appConfig.deviceName, DEVICE_TYPE,
+                       FIRMWARE_VERSION);
+    telegramEnabled = false;
+    telegramStatus = "не используется: связь через хаб (MQTT)";
+    Serial.println("Связь: хаб роя через MQTT " + mqttLink.serverText());
+    return;
+  }
+  mqttMode = false;
+  initTelegram();
+}
+
+// Состояние для хаба: retained-сообщение в swarm/dev/<id>/state.
+// Публикуется при изменении и раз в минуту (uptime, сигнал).
+static String buildStateJson(bool full) {
+  DynamicJsonDocument doc(1024);
+  doc["name"] = deviceDisplayName();
+  doc["armed"] = appConfig.armed;
+  doc["periodic"] = appConfig.periodicEnabled;
+  doc["periodicMinutes"] = appConfig.periodicMinutes;
+  doc["motionCount"] = appConfig.motionCount;
+  doc["manualCount"] = appConfig.manualCount;
+  doc["timeoutSeconds"] = appConfig.timeoutSeconds;
+  doc["camera"] = cameraService.isReady();
+  doc["cameraStatus"] = cameraStatus;
+  JsonObject owner = doc.createNestedObject("owner");
+  owner["enabled"] = ownerPresence.isEnabled();
+  owner["present"] = ownerPresence.isPresent();
+  JsonObject quiet = doc.createNestedObject("quiet");
+  quiet["enabled"] = appConfig.quietEnabled;
+  quiet["now"] = scheduleManager.isQuietNow();
+  quiet["start"] = appConfig.quietStart;
+  quiet["end"] = appConfig.quietEnd;
+  doc["pending"] = pendingMotionPhotos + pendingManualPhotos + pendingPeriodicPhotos +
+                   pendingOwnerArrivals + pendingOwnerDepartures;
+  if (full) {
+    owner["text"] = ownerPresence.status();
+    doc["uptime"] = millis() / 1000;
+    doc["rssi"] = WiFi.RSSI();
+    doc["ip"] = WiFi.localIP().toString();
+    doc["fw"] = FIRMWARE_VERSION;
+  }
+  String json;
+  serializeJson(doc, json);
+  return json;
+}
+
+static void publishStateIfNeeded(bool force = false) {
+  if (!mqttMode) return;
+  const String signature = buildStateJson(false);
+  const uint32_t now = millis();
+  if (!force && signature == lastStateSignature && now - lastStatePublishMs < STATE_HEARTBEAT_MS) return;
+  if (mqttLink.publishState(buildStateJson(true))) {
+    lastStateSignature = signature;
+    lastStatePublishMs = now;
   }
 }
 
@@ -509,6 +620,9 @@ static String buildStatus() {
   s += "Прошивка " + String(FIRMWARE_VERSION) + ", работает " + formatUptime(millis()) +
        ", причина запуска: " + systemHealth.resetReasonText() + "\n";
   if (systemHealth.bootNote().length()) s += "!" + systemHealth.bootNote() + "\n";
+  s += "Устройство: " + deviceDisplayName() + " (ID " + deviceId + ", тип " + DEVICE_TYPE + ")\n";
+  s += "Охрана: " + String(appConfig.armed ? "на охране" : "снята") + "; плановые снимки: " +
+       (appConfig.periodicEnabled ? "включены" : "выключены") + "\n";
   if (systemHealth.safeMode()) s += "!Безопасный режим: камера и Telegram отключены.\n";
   if (!configStore.ready()) s += "!NVS недоступна: настройки не сохраняются.\n";
   if (!devicePasswordSaved) s += "!Пароль веб-панели не сохранён в NVS.\n";
@@ -534,7 +648,10 @@ static String buildStatus() {
 
   s += "Капитан: " + ownerPresence.status() + "\n";
 
-  s += String(telegramEnabled ? "" : "!") + "Telegram: " + telegramStatus;
+  if (mqttMode) {
+    s += String(mqttLink.connected() ? "" : "!") + "Хаб (MQTT): " + mqttLink.status() + "\n";
+  }
+  s += String(telegramEnabled || mqttMode ? "" : "!") + "Telegram: " + telegramStatus;
   if (telegramEnabled) {
     s += ", чатов: " + String(telegramService.chatCount()) + ", через " + telegramService.endpointText() +
          "; " + telegramService.lastResult();
@@ -571,6 +688,7 @@ static void printSerialHelp() {
   Serial.println("  setpassword <пароль>  — задать свой пароль панели/OTA (8–63 символа)");
   Serial.println("  config                — показать настройки (без секретов)");
   Serial.println("  status                — состояние модулей");
+  Serial.println("  arm | disarm          — поставить на охрану / снять с охраны");
   Serial.println("  reboot                — перезапуск");
   Serial.println("  factoryreset yes      — стереть все настройки и перезапуститься");
   Serial.println("  about                 — что это за устройство и как им пользоваться");
@@ -587,7 +705,10 @@ static void printAbout() {
   Serial.println(" Камера-сторож с уведомлениями в Telegram.");
   Serial.println(" - Сравнивает кадры и при движении шлёт N фото в Telegram (не чаще раза в TO секунд).");
   Serial.println(" - Раз в X минут шлёт плановый снимок.");
-  Serial.println(" - Бот: /getcapture — M фото, /status — состояние, /help — описание, кнопки под ответом.");
+  Serial.println(" - Это охранник (тип guard) в рое устройств. Имя, ID и режимы — команда config.");
+  Serial.println(" - Связь: хаб роя (MQTT-брокер на VPS + общий Telegram-бот, папка hub/ в исходниках)");
+  Serial.println("   или, если адрес брокера не задан, напрямую свой Telegram-бот.");
+  Serial.println(" - Команды: /arm, /disarm — охрана; /getcapture — фото; /periodic on|off; /status; /help.");
   Serial.println(" - До 5 чатов (ID через запятую): тревоги — всем, ответ на команду — спросившему.");
   Serial.println(" - Если задан IP телефона капитана: пока телефон в этой Wi-Fi сети — тревоги не шлёт;");
   Serial.println("   сообщает «Капитан на мостике» (пришёл) и «Сторож бдит» (ушёл).");
@@ -659,6 +780,8 @@ static void handleSerialCommand(String line) {
     printConfiguration();
   } else if (command == "status") {
     Serial.print(buildStatus());
+  } else if (command == "arm" || command == "disarm") {
+    setArmed(command == "arm", "консоль");
   } else if (command == "reboot") {
     Serial.println("Перезапуск...");
     Serial.flush();
@@ -710,6 +833,12 @@ static String maskedText(const String &value) {
 // пароль Wi-Fi и токен Telegram — только признаком «задан».
 static void printConfiguration() {
   Serial.println("---------------- Настройки ----------------");
+  Serial.println("Устройство: " + deviceDisplayName() + " (ID " + deviceId + ", тип " + DEVICE_TYPE + ")");
+  Serial.println(String("Охрана: ") + (appConfig.armed ? "на охране" : "снята") +
+                 ", плановые снимки: " + (appConfig.periodicEnabled ? "вкл" : "выкл"));
+  Serial.println("Хаб MQTT: " + (appConfig.mqttHost.isEmpty() ? String("(не задан — прямой режим Telegram)")
+                                                              : appConfig.mqttHost + ":" + String(appConfig.mqttPort) +
+                                                                    ", логин " + (appConfig.mqttUser.isEmpty() ? String("(нет)") : appConfig.mqttUser)));
   Serial.println("NVS: " + String(configStore.ready() ? "доступна" : "НЕДОСТУПНА (значения по умолчанию)"));
   Serial.println("Пароль точки доступа (не меняется): " + accessPointPassword());
   Serial.println("Пароль веб-панели и OTA (логин admin): " +
@@ -741,15 +870,21 @@ static void printConfiguration() {
 static const char *BOT_KEYBOARD =
     "{\"inline_keyboard\":[[{\"text\":\"📷 Снимок\",\"callback_data\":\"getcapture\"},"
     "{\"text\":\"ℹ️ Статус\",\"callback_data\":\"status\"}],"
+    "[{\"text\":\"🛡 На охрану\",\"callback_data\":\"arm\"},"
+    "{\"text\":\"🔓 Снять\",\"callback_data\":\"disarm\"}],"
     "[{\"text\":\"❓ Помощь\",\"callback_data\":\"help\"}]]}";
 
+static String armedText() {
+  return appConfig.armed ? "🛡 на охране" : "🔓 снят с охраны";
+}
+
 static String botHelpText() {
-  const String name = apName.isEmpty() ? makeAccessPointName() : apName;
-  String s = "📷 AI-Thinker Guard (" + name + "), прошивка " + String(FIRMWARE_VERSION) + "\n\n";
+  String s = "📷 " + deviceDisplayName() + " — охранник (guard), прошивка " + String(FIRMWARE_VERSION) + "\n";
+  s += "Сейчас: " + armedText() + ", плановые снимки " + (appConfig.periodicEnabled ? "включены" : "выключены") + ".\n\n";
   s += "Что я делаю:\n";
-  s += "• При движении присылаю " + String(appConfig.motionCount) + " фото, не чаще раза в " +
+  s += "• На охране: при движении присылаю " + String(appConfig.motionCount) + " фото, не чаще раза в " +
        String(appConfig.timeoutSeconds) + " с.\n";
-  s += "• Каждые " + String(appConfig.periodicMinutes) + " мин — плановый снимок.\n";
+  s += "• Каждые " + String(appConfig.periodicMinutes) + " мин — плановый снимок (если включены).\n";
   if (appConfig.quietEnabled) {
     s += "• Тихие часы " + appConfig.quietStart + "–" + appConfig.quietEnd +
          ": ничего не присылаю, после — сводка и свежий кадр.\n";
@@ -760,17 +895,17 @@ static String botHelpText() {
     s += "• Пока телефон капитана в Wi-Fi, тревоги по движению не шлю. Сообщаю «Капитан на мостике» и «Сторож бдит» (уход — после " +
          String(appConfig.ownerAwayMinutes) + " мин без связи).\n";
   }
-  s += "\nКоманды:\n";
-  s += "/getcapture — снимок прямо сейчас (" + String(appConfig.manualCount) + " шт., работает и в тихие часы)\n";
-  s += "/status — состояние камеры\n";
-  s += "/help — это описание\n";
-  s += "\nВсе подписанные чаты (" + String(telegramService.chatCount()) +
-       ") получают тревоги; на команду отвечаю тому, кто спросил.";
+  s += "\nКоманды (можно добавить имя устройства: /arm " + deviceDisplayName() + "):\n";
+  s += "/getcapture — снимок прямо сейчас (" + String(appConfig.manualCount) + " шт., и в тихие часы)\n";
+  s += "/arm — поставить на охрану, /disarm — снять с охраны\n";
+  s += "/periodic on | off — плановые снимки\n";
+  s += "/status — состояние, /help — это описание";
   return s;
 }
 
 static String botStatusText() {
-  String s = "ℹ️ Состояние\n";
+  String s = "ℹ️ " + deviceDisplayName() + ": " + armedText() + "\n";
+  s += "Плановые снимки: " + String(appConfig.periodicEnabled ? "каждые " + String(appConfig.periodicMinutes) + " мин" : "выключены") + "\n";
   s += "Работаю: " + formatUptime(millis()) + ", запуск: " + systemHealth.resetReasonText() + "\n";
   s += "Камера: " + cameraStatus + "\n";
   s += "Капитан: " + ownerPresence.status() + "\n";
@@ -785,22 +920,83 @@ static String botStatusText() {
   return s;
 }
 
-static void handleBotCommand(const TelegramCommand &command) {
-  Serial.println("Telegram: команда «" + command.name + "» из чата " + command.chatId);
+// Адресована ли команда этому устройству (прямой режим, общая группа ботов):
+// без аргумента — да; иначе по имени, ID, типу «guard» или «all»/«все».
+static bool commandTargetsMe(const String &rawTarget) {
+  String target = utf8Lower(rawTarget);
+  target.trim();
+  if (target.isEmpty() || target == "all" || target == "все" || target == DEVICE_TYPE) return true;
+  if (target == utf8Lower(deviceId)) return true;
+  return !appConfig.deviceName.isEmpty() && target == utf8Lower(appConfig.deviceName);
+}
+
+static void reply(const DeviceCommand &command, const String &text) {
+  if (mqttMode) {
+    sendText(text, "reply", command.chatId);
+  } else {
+    telegramService.sendMessageTo(command.chatId, withName(text), BOT_KEYBOARD);
+  }
+}
+
+static void setArmed(bool armed, const String &source) {
+  if (appConfig.armed != armed) {
+    appConfig.armed = armed;
+    configStore.saveModes(appConfig);
+    motionDetector.reset();
+    motionActionStarted = false;
+  }
+  Serial.println(String(armed ? "Поставлено на охрану" : "Снято с охраны") + " (" + source + ")");
+  publishStateIfNeeded(true);
+}
+
+static void setPeriodic(bool enabled, const String &source) {
+  if (appConfig.periodicEnabled != enabled) {
+    appConfig.periodicEnabled = enabled;
+    configStore.saveModes(appConfig);
+    lastPeriodicCaptureMs = millis();
+  }
+  Serial.println(String("Плановые снимки ") + (enabled ? "включены" : "выключены") + " (" + source + ")");
+  publishStateIfNeeded(true);
+}
+
+static void handleCommand(DeviceCommand command) {
+  // «/periodic on скворечник»: первое слово — режим, остальное — адресат.
+  String mode;
+  if (command.name == "periodic") {
+    const int space = command.arg.indexOf(' ');
+    mode = space < 0 ? command.arg : command.arg.substring(0, space);
+    command.arg = space < 0 ? "" : command.arg.substring(space + 1);
+    mode = utf8Lower(mode);
+    mode.trim();
+  }
+  // В режиме хаба адресата уже выбрал хаб; в прямом проверяем сами.
+  if (!mqttMode && !commandTargetsMe(command.arg)) {
+    telegramService.answerCallback(command.callbackId);
+    return;
+  }
+  Serial.println("Команда «" + command.name + "»" + (command.chatId.isEmpty() ? "" : " из чата " + command.chatId));
+  if (!mqttMode) {
+    telegramService.answerCallback(command.callbackId, command.name == "getcapture" ? "Снимаю…" : "");
+  }
+
   if (command.name == "getcapture") {
-    telegramService.answerCallback(command.callbackId, "Снимаю…");
     sendPhotoBurst(appConfig.manualCount, "Снимок по запросу", PhotoKind::Manual, command.chatId);
   } else if (command.name == "status") {
-    telegramService.answerCallback(command.callbackId);
-    telegramService.sendMessageTo(command.chatId, botStatusText(), BOT_KEYBOARD);
+    reply(command, botStatusText());
+  } else if (command.name == "arm" || command.name == "disarm") {
+    setArmed(command.name == "arm", "команда");
+    reply(command, armedText());
+  } else if (command.name == "periodic") {
+    if (mode == "on" || mode == "вкл" || mode == "1") setPeriodic(true, "команда");
+    else if (mode == "off" || mode == "выкл" || mode == "0") setPeriodic(false, "команда");
+    reply(command, String("Плановые снимки ") +
+                       (appConfig.periodicEnabled ? "включены, каждые " + String(appConfig.periodicMinutes) + " мин"
+                                                  : "выключены") +
+                       (mode.isEmpty() ? ". Включить/выключить: /periodic on | off" : ""));
   } else if (command.name == "start" || command.name == "help") {
-    telegramService.answerCallback(command.callbackId);
-    telegramService.sendMessageTo(command.chatId, botHelpText(), BOT_KEYBOARD);
-  } else {
-    telegramService.answerCallback(command.callbackId);
-    telegramService.sendMessageTo(command.chatId,
-                                  "Не знаю такой команды. Нажмите кнопку или отправьте /help.",
-                                  BOT_KEYBOARD);
+    reply(command, botHelpText());
+  } else if (!mqttMode) {
+    reply(command, "Не знаю такой команды. Нажмите кнопку или отправьте /help.");
   }
 }
 
@@ -826,6 +1022,13 @@ void setup() {
   }
   configStore.load(appConfig);
   telegramUpdateOffset = configStore.loadUpdateOffset();
+  {
+    uint8_t mac[6];
+    readMac(mac);
+    char id[20];
+    snprintf(id, sizeof(id), "%s-%02x%02x%02x", DEVICE_TYPE, mac[3], mac[4], mac[5]);
+    deviceId = id;
+  }
   printConfiguration();
 
 
@@ -838,8 +1041,8 @@ void setup() {
   tryStartCamera();
   feedWatchdog();
 
-  Serial.println("[init] Telegram...");
-  initTelegram();
+  Serial.println("[init] Связь (хаб MQTT или Telegram)...");
+  initChannel();
 
   Serial.println("[init] NTP/расписание...");
   scheduleManager.begin(appConfig);
@@ -850,6 +1053,7 @@ void setup() {
   webConfigServer.setStatusProvider(buildStatus);
   webConfigServer.setFirmwareVersion(FIRMWARE_VERSION);
   webConfigServer.setDeviceName(apName.isEmpty() ? makeAccessPointName() : apName);
+  publishStateIfNeeded(true);
   webConfigServer.setBeforeRestart([]() { systemHealth.clearBlocks(); });
 
   // Состояние капитана станет известно после первой проверки; до этого
@@ -896,7 +1100,14 @@ void loop() {
     tryStartCamera();
   }
 
-  if (telegramEnabled && WiFi.status() == WL_CONNECTED &&
+  if (mqttMode) {
+    mqttLink.loop();
+    DeviceCommand command;
+    while (mqttLink.popCommand(command)) handleCommand(command);
+    publishStateIfNeeded();
+  }
+
+  if (!mqttMode && telegramEnabled && WiFi.status() == WL_CONNECTED &&
       now - lastTelegramPollMs >= telegramPollIntervalMs) {
     lastTelegramPollMs = now;
     TelegramCommand command;
@@ -914,11 +1125,12 @@ void loop() {
     if (telegramService.lastRequestOk() && !telegramCommandsPublished) {
       telegramCommandsPublished = telegramService.publishCommands();
     }
-    if (gotCommand) handleBotCommand(command);
+    if (gotCommand) handleCommand(command);
     if (telegramUpdateOffset != oldOffset) configStore.saveUpdateOffset(telegramUpdateOffset);
   }
 
-  if (cameraService.isReady() && telegramEnabled &&
+  // Детектор работает только на охране: снятая с охраны камера молчит.
+  if (cameraService.isReady() && channelEnabled() && appConfig.armed &&
       now - lastMotionSampleMs >= MOTION_SAMPLE_INTERVAL_MS) {
     lastMotionSampleMs = now;
     const uint8_t *pixels = nullptr;
@@ -941,7 +1153,7 @@ void loop() {
   }
 
   const uint32_t periodicMs = static_cast<uint32_t>(appConfig.periodicMinutes) * 60000UL;
-  if (cameraService.isReady() && telegramEnabled &&
+  if (cameraService.isReady() && channelEnabled() && appConfig.periodicEnabled &&
       millis() - lastPeriodicCaptureMs >= periodicMs) {
     lastPeriodicCaptureMs = millis();
     sendPhotoBurst(1, "Плановый снимок", PhotoKind::Periodic);

@@ -1,0 +1,12 @@
+{
+  "telegram_token": "123456789:ВАШ_ТОКЕН_ОТ_BOTFATHER",
+  "allowed_chats": [123456789],
+  "telegram_api": "https://api.telegram.org",
+  "offline_alert_seconds": 180,
+  "mqtt": {
+    "host": "127.0.0.1",
+    "port": 1883,
+    "user": "hub",
+    "password": "ПАРОЛЬ_ХАБА"
+  }
+}
