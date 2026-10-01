@@ -108,10 +108,10 @@ String WifiPresence::status() const {
   if (WiFi.status() != WL_CONNECTED) return text + "проверка ждёт подключения к Wi-Fi";
   if (!sameSubnet_) return text + "не в подсети камеры — проверьте IP";
   if (!everSeen_) {
-    return text + (hasVerdict() ? "не отвечает, капитан не на постике"
+    return text + (hasVerdict() ? "не отвечает, капитан не на мостике"
                                 : "ещё не отвечал, жду до " + String(awayMs_ / 60000) + " мин");
   }
   const uint32_t ago = (millis() - lastSeenMs_) / 1000;
-  return text + (isPresent() ? "в сети, капитан на постике" : "пропал, капитан ушёл") +
+  return text + (isPresent() ? "в сети, капитан на мостике" : "пропал, капитан ушёл") +
          " (последний ответ " + String(ago) + " с назад)";
 }

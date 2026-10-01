@@ -437,7 +437,7 @@ static void flushPendingWork() {
   lastPendingFlushMs = now;
 
   String summary = "Отложенные события за время недоступности/режима тишины:";
-  if (pendingOwnerArrivals) summary += "\n«Капитан на постике»: " + String(pendingOwnerArrivals);
+  if (pendingOwnerArrivals) summary += "\n«Капитан на мостике»: " + String(pendingOwnerArrivals);
   if (pendingOwnerDepartures) summary += "\n«Сторож бдит»: " + String(pendingOwnerDepartures);
   if (pendingMotionPhotos) summary += "\nСнимки по движению: " + String(pendingMotionPhotos);
   if (pendingManualPhotos) summary += "\nСнимки GetCapture: " + String(pendingManualPhotos);
@@ -590,7 +590,7 @@ static void printAbout() {
   Serial.println(" - Бот: /getcapture — M фото, /status — состояние, /help — описание, кнопки под ответом.");
   Serial.println(" - До 5 чатов (ID через запятую): тревоги — всем, ответ на команду — спросившему.");
   Serial.println(" - Если задан IP телефона капитана: пока телефон в этой Wi-Fi сети — тревоги не шлёт;");
-  Serial.println("   сообщает «Капитан на постике» (пришёл) и «Сторож бдит» (ушёл).");
+  Serial.println("   сообщает «Капитан на мостике» (пришёл) и «Сторож бдит» (ушёл).");
   Serial.println(" - Тихие часы: события копятся и приходят сводкой после окончания.");
   Serial.println();
   Serial.println("КАК НАСТРОИТЬ:");
@@ -757,7 +757,7 @@ static String botHelpText() {
     s += "• Тихие часы выключены.\n";
   }
   if (ownerPresence.isEnabled()) {
-    s += "• Пока телефон капитана в Wi-Fi, тревоги по движению не шлю. Сообщаю «Капитан на постике» и «Сторож бдит» (уход — после " +
+    s += "• Пока телефон капитана в Wi-Fi, тревоги по движению не шлю. Сообщаю «Капитан на мостике» и «Сторож бдит» (уход — после " +
          String(appConfig.ownerAwayMinutes) + " мин без связи).\n";
   }
   s += "\nКоманды:\n";
@@ -887,7 +887,7 @@ void loop() {
     ownerStateInitialized = true;
   } else if (ownerPresent != previousOwnerPresent) {
     previousOwnerPresent = ownerPresent;
-    notifyOrQueue(ownerPresent ? "Капитан на постике" : "Сторож бдит", ownerPresent);
+    notifyOrQueue(ownerPresent ? "Капитан на мостике" : "Сторож бдит", ownerPresent);
   }
 
   if (!cameraService.isReady() && !systemHealth.isBlocked(MODULE_CAMERA) &&
